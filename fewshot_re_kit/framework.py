@@ -10,7 +10,20 @@ from torch import autograd, optim, nn
 from torch.autograd import Variable
 from torch.nn import functional as F
 # from pytorch_pretrained_bert import BertAdam
-from transformers import AdamW, get_linear_schedule_with_warmup
+try:
+    from transformers import AdamW
+except ImportError:
+    from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
+
+try:
+    from .wandb_utils import log_metrics, save_model_artifact
+except Exception:
+    def log_metrics(metrics):
+        return None
+
+    def save_model_artifact(path, name, artifact_type="model"):
+        return False
 
 def warmup_linear(global_step, warmup_step):
     if global_step < warmup_step:
@@ -120,7 +133,8 @@ class FewShotREFramework:
               pair=False,
               adv_dis_lr=1e-1,
               adv_enc_lr=1e-1,
-              use_sgd_for_bert=False):
+              use_sgd_for_bert=False,
+              use_wandb=False):
         '''
         model: a FewShotREModel instance
         model_name: Name of the model
@@ -153,9 +167,15 @@ class FewShotREFramework:
             if use_sgd_for_bert:
                 optimizer = torch.optim.SGD(parameters_to_optimize, lr=learning_rate)
             else:
-                optimizer = AdamW(parameters_to_optimize, lr=learning_rate, correct_bias=False)
+                try:
+                    optimizer = AdamW(parameters_to_optimize, lr=learning_rate, correct_bias=False)
+                except TypeError:
+                    optimizer = AdamW(parameters_to_optimize, lr=learning_rate)
             if self.adv:
-                optimizer_encoder = AdamW(parameters_to_optimize, lr=1e-5, correct_bias=False)
+                try:
+                    optimizer_encoder = AdamW(parameters_to_optimize, lr=1e-5, correct_bias=False)
+                except TypeError:
+                    optimizer_encoder = AdamW(parameters_to_optimize, lr=1e-5)
             scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_step, num_training_steps=train_iter) 
         else:
             optimizer = pytorch_optim(model.parameters(),
@@ -277,13 +297,32 @@ class FewShotREFramework:
             sys.stdout.flush()
 
             if (it + 1) % val_step == 0:
+                train_loss = iter_loss / max(iter_sample, 1.0)
+                train_acc = iter_right / max(iter_sample, 1.0)
                 acc = self.eval(model, B, N_for_eval, K, Q, val_iter, 
                         na_rate=na_rate, pair=pair)
                 model.train()
+                if use_wandb:
+                    payload = {
+                        "train/loss": train_loss,
+                        "train/acc": train_acc,
+                        "val/acc": acc,
+                        "step": it + 1,
+                    }
+                    if self.adv and iter_sample > 0:
+                        payload["train/dis_loss"] = iter_loss_dis / iter_sample
+                        payload["train/dis_acc"] = iter_right_dis / iter_sample
+                    if hasattr(model, "last_gib_loss"):
+                        payload["train/gib_loss"] = float(model.last_gib_loss.detach().cpu())
+                    if hasattr(model, "last_bal_loss"):
+                        payload["train/bal_loss"] = float(model.last_bal_loss.detach().cpu())
+                    log_metrics(payload)
                 if acc > best_acc:
                     print('Best checkpoint')
                     torch.save({'state_dict': model.state_dict()}, save_ckpt)
                     best_acc = acc
+                    if use_wandb and save_ckpt:
+                        save_model_artifact(save_ckpt, name=model_name + "-best", artifact_type="model")
                 iter_loss = 0.
                 iter_loss_dis = 0.
                 iter_right = 0.
@@ -292,6 +331,8 @@ class FewShotREFramework:
                 
         print("\n####################\n")
         print("Finish training " + model_name)
+        if use_wandb:
+            log_metrics({"train/best_val_acc": best_acc})
 
     def eval(self,
             model,

@@ -10,6 +10,9 @@ from models.siamese import Siamese
 from models.pair import Pair
 from models.d import Discriminator
 from models.mtb import Mtb
+from models.moe_graph import MoEGraphProto
+from fewshot_re_kit.llm_encoder import LLMSentenceEncoder
+from fewshot_re_kit.wandb_utils import init_wandb_run, log_metrics, finish_run
 import sys
 import torch
 from torch import optim, nn
@@ -17,6 +20,7 @@ import numpy as np
 import json
 import argparse
 import os
+from datetime import datetime
 
 def main():
     parser = argparse.ArgumentParser()
@@ -100,6 +104,49 @@ def main():
     parser.add_argument('--use_sgd_for_bert', action='store_true',
            help='use SGD instead of AdamW for BERT.')
 
+    # llm encoder + graph/MoE model (moegraph)
+    parser.add_argument('--llm_model', default='gpt2',
+           help='HF causal-LM id/path for the llm encoder')
+    parser.add_argument('--llm_4bit', action='store_true',
+           help='load the llm encoder in 4-bit (needs bitsandbytes + CUDA)')
+    parser.add_argument('--llm_no_lora', action='store_true',
+           help='disable LoRA on the llm encoder (freeze it instead)')
+    parser.add_argument('--lora_r', default=8, type=int, help='LoRA rank')
+    parser.add_argument('--lora_alpha', default=32, type=int, help='LoRA alpha')
+    parser.add_argument('--num_experts', default=4, type=int,
+           help='number of graph experts in the MoE')
+    parser.add_argument('--expert_dim', default=128, type=int,
+           help='graph expert hidden/output dim')
+    parser.add_argument('--aggcn_layers', default=2, type=int,
+           help='number of AGGCN layers per expert')
+    parser.add_argument('--aggcn_heads', default=4, type=int,
+           help='attention heads in each AGGCN layer')
+    parser.add_argument('--no_vgib', action='store_true',
+           help='disable VGIB edge masking')
+    parser.add_argument('--no_moe', action='store_true',
+           help='disable MoE routing (single graph expert)')
+    parser.add_argument('--gib_weight', default=1e-3, type=float,
+           help='weight of the VGIB KL regularizer')
+    parser.add_argument('--bal_weight', default=1e-2, type=float,
+           help='weight of the MoE load-balance loss')
+
+    # Weights & Biases
+    parser.add_argument('--wandb', action='store_true',
+           help='enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', default='FewRel',
+           help='W&B project name')
+    parser.add_argument('--wandb_entity', default=None,
+           help='W&B entity/team (optional)')
+    parser.add_argument('--wandb_api_key', default=None,
+           help='W&B API key (prefer WANDB_API_KEY env var)')
+    parser.add_argument('--wandb_mode', default='online',
+           choices=['online', 'offline', 'auto'],
+           help='W&B mode')
+    parser.add_argument('--wandb_run_name', default=None,
+           help='optional W&B run name')
+    parser.add_argument('--wandb_no_offline_fallback', action='store_true',
+           help='do not fall back to offline mode on online init failure')
+
     opt = parser.parse_args()
     trainN = opt.trainN
     N = opt.N
@@ -148,6 +195,14 @@ def main():
                     pretrain_ckpt,
                     max_length,
                     cat_entity_rep=opt.cat_entity_rep)
+    elif encoder_name == 'llm':
+        sentence_encoder = LLMSentenceEncoder(
+                opt.llm_model,
+                max_length,
+                load_4bit=opt.llm_4bit,
+                use_lora=not opt.llm_no_lora,
+                lora_r=opt.lora_r,
+                lora_alpha=opt.lora_alpha)
     else:
         raise NotImplementedError
     
@@ -210,6 +265,19 @@ def main():
         model = Pair(sentence_encoder, hidden_size=opt.hidden_size)
     elif model_name == 'mtb':
         model = Mtb(sentence_encoder, use_dropout=not opt.no_dropout)
+    elif model_name == 'moegraph':
+        model = MoEGraphProto(
+                sentence_encoder,
+                num_experts=opt.num_experts,
+                expert_dim=opt.expert_dim,
+                aggcn_layers=opt.aggcn_layers,
+                aggcn_heads=opt.aggcn_heads,
+                dropout=opt.dropout,
+                use_vgib=not opt.no_vgib,
+                use_moe=not opt.no_moe,
+                gib_weight=opt.gib_weight,
+                bal_weight=opt.bal_weight,
+                dot=opt.dot)
     else:
         raise NotImplementedError
     
@@ -222,8 +290,28 @@ def main():
     if torch.cuda.is_available():
         model.cuda()
 
+    use_wandb = False
+    if opt.wandb:
+        run_name = opt.wandb_run_name or prefix
+        run_name = "{}_{}".format(run_name, datetime.now().strftime("%Y%m%d-%H%M%S"))
+        allow_offline_fallback = (opt.wandb_mode != "online") and (not opt.wandb_no_offline_fallback)
+        wandb_config = {k: v for k, v in vars(opt).items() if k != "wandb_api_key"}
+        use_wandb = bool(
+            init_wandb_run(
+                run_name,
+                wandb_config,
+                project=opt.wandb_project,
+                entity=opt.wandb_entity,
+                api_key=opt.wandb_api_key,
+                mode=opt.wandb_mode,
+                allow_offline_fallback=allow_offline_fallback,
+            )
+        )
+        if not use_wandb:
+            print("[W&B] Initialization failed. Training continues without W&B logging.")
+
     if not opt.only_test:
-        if encoder_name in ['bert', 'roberta']:
+        if encoder_name in ['bert', 'roberta', 'llm']:
             bert_optim = True
         else:
             bert_optim = False
@@ -239,7 +327,8 @@ def main():
                 pytorch_optim=pytorch_optim, load_ckpt=opt.load_ckpt, save_ckpt=ckpt,
                 na_rate=opt.na_rate, val_step=opt.val_step, fp16=opt.fp16, pair=opt.pair, 
                 train_iter=opt.train_iter, val_iter=opt.val_iter, bert_optim=bert_optim, 
-                learning_rate=opt.lr, use_sgd_for_bert=opt.use_sgd_for_bert, grad_iter=opt.grad_iter)
+                learning_rate=opt.lr, use_sgd_for_bert=opt.use_sgd_for_bert,
+                grad_iter=opt.grad_iter, use_wandb=use_wandb)
     else:
         ckpt = opt.load_ckpt
         if ckpt is None:
@@ -248,6 +337,9 @@ def main():
 
     acc = framework.eval(model, batch_size, N, K, Q, opt.test_iter, na_rate=opt.na_rate, ckpt=ckpt, pair=opt.pair)
     print("RESULT: %.2f" % (acc * 100))
+    if use_wandb:
+        log_metrics({"test/acc": acc, "test/acc_pct": acc * 100})
+        finish_run()
 
 if __name__ == "__main__":
     main()

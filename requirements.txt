@@ -33,3 +33,10 @@ python-dotenv>=1.0
 # NVIDIA Apex for --fp16 with older FewRel scripts:
 #   https://github.com/NVIDIA/apex
 # python-dotenv>=1.0   # if you want auto-load of .env
+
+
+# Google Drive API
+google-api-python-client>=2.125.0
+google-auth>=2.29.0
+google-auth-oauthlib>=1.2.0
+requests

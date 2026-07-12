@@ -1,0 +1,172 @@
+# FewRel — command cheat sheet
+# Chạy từ thư mục FewRel:  cd FewRel
+
+---
+
+## Setup
+
+```bash
+cd FewRel
+pip install -r requirements.txt
+cp .env.example .env          # điền WANDB_API_KEY nếu dùng --wandb
+python download_wiki_data.py  # nếu chưa có train_wiki / val_wiki
+```
+
+Local eval: luôn `--test val_wiki` (không có `test_wiki.json`).
+
+---
+
+## Model × encoder (hợp lệ)
+
+| Model | Encoder | Ghi chú |
+|--------|---------|---------|
+| `moegraph` | `roberta` (khuyên dùng) hoặc `llm` | RoBERTa default ckpt: `FacebookAI/xlm-roberta-large` |
+| `proto`, `gnn`, `snail`, `siamese`, `mtb` | `cnn` / `bert` / `roberta` | Baseline |
+| `pair` | `bert` / `roberta` + `--pair` | PAIR |
+| `metanet` | `cnn` only | `batch_size=1` |
+
+N-way K-shot: `--N` = số class, `--K` = support/class, `--Q` = query/class, `--trainN` = N lúc train.
+
+---
+
+## 1) MoE-Graph + XLM-RoBERTa (recommended)
+
+```bash
+# [Recommended] moegraph + xlm-roberta-large, 5-way 5-shot (Q=5)
+python train_demo.py --model moegraph --encoder roberta \
+  --pretrain_ckpt FacebookAI/xlm-roberta-large \
+  --trainN 5 --N 5 --K 5 --Q 5 \
+  --batch_size 1 --max_length 64 \
+  --test val_wiki
+
+# Giống trên nhưng rút gọn (default ckpt đã là xlm-roberta-large) + log W&B
+python train_demo.py --model moegraph --encoder roberta \
+  --trainN 5 --N 5 --K 5 --Q 5 --batch_size 1 --max_length 64 \
+  --test val_wiki --wandb
+
+# VRAM thấp: 4-bit quantize, 5-way 1-shot (K=1, Q=1)
+python train_demo.py --model moegraph --encoder roberta \
+  --llm_4bit --batch_size 1 --max_length 64 \
+  --trainN 5 --N 5 --K 1 --Q 1 --test val_wiki
+```
+
+---
+
+## 2) MoE-Graph + causal LLM
+
+```bash
+# Smoke test nhanh với GPT-2, 5-way 5-shot (không cần GPU lớn)
+python train_demo.py --model moegraph --encoder llm --llm_model gpt2 \
+  --trainN 5 --N 5 --K 5 --Q 5 --batch_size 2 --test val_wiki
+
+# LLM lớn hơn (Llama-3.2-1B) + 4-bit + LoRA, 5-way 1-shot
+# Cần: bitsandbytes + peft + CUDA
+python train_demo.py --model moegraph --encoder llm \
+  --llm_model meta-llama/Llama-3.2-1B --llm_4bit \
+  --trainN 5 --N 5 --K 1 --Q 1 --batch_size 2 --test val_wiki
+
+# Qwen 1.5B + 4-bit, 5-way 1-shot + W&B
+python train_demo.py --model moegraph --encoder llm \
+  --llm_model Qwen/Qwen2.5-1.5B --llm_4bit \
+  --trainN 5 --N 5 --K 1 --Q 1 --batch_size 2 --max_length 64 \
+  --test val_wiki --wandb
+```
+
+---
+
+## 3) Ablations (moegraph)
+
+```bash
+# Ablation: tắt MoE → dùng single expert
+python train_demo.py --model moegraph --encoder llm --llm_model gpt2 --no_moe \
+  --trainN 5 --N 5 --K 5 --Q 5 --batch_size 2 --test val_wiki
+
+# Ablation: tắt VGIB edge masking
+python train_demo.py --model moegraph --encoder llm --llm_model gpt2 --no_vgib \
+  --trainN 5 --N 5 --K 5 --Q 5 --batch_size 2 --test val_wiki
+```
+
+---
+
+## 4) Baselines (so sánh)
+
+```bash
+# ProtoNet + CNN, 5-way 5-shot
+python train_demo.py --model proto --encoder cnn \
+  --trainN 5 --N 5 --K 5 --Q 5 --test val_wiki
+
+# PAIR + BERT, 5-way 5-shot (bắt buộc --pair)
+python train_demo.py --model pair --encoder bert --pair \
+  --trainN 5 --N 5 --K 5 --Q 5 --test val_wiki
+
+# Proto + RoBERTa-base, 5-way 5-shot
+python train_demo.py --model proto --encoder roberta \
+  --pretrain_ckpt roberta-base --hidden_size 768 \
+  --trainN 5 --N 5 --K 5 --Q 5 --batch_size 4 \
+  --test val_wiki
+
+# PAIR + RoBERTa-base, 5-way 1-shot (FewRel 2.0 style)
+python train_demo.py --model pair --encoder roberta --pair \
+  --pretrain_ckpt roberta-base --hidden_size 768 \
+  --trainN 5 --N 5 --K 1 --Q 1 --batch_size 4 \
+  --val_step 1000 --test val_wiki
+```
+
+So sánh công bằng với `moegraph`: giữ cùng `--N --K --Q --trainN --val_iter --test_iter --test`.
+
+---
+
+## 5) Grid benchmark chuẩn
+
+```text
+N ∈ {5, 10}    K ∈ {1, 5}    Q = 1 hoặc 5
+--train train_wiki --val val_wiki --test val_wiki
+```
+
+```bash
+# 5-way 1-shot (moegraph + gpt2)
+python train_demo.py --model moegraph --encoder llm --llm_model gpt2 \
+  --trainN 5 --N 5 --K 1 --Q 1 --batch_size 2 --test val_wiki
+
+# 10-way 5-shot (moegraph + gpt2)
+python train_demo.py --model moegraph --encoder llm --llm_model gpt2 \
+  --trainN 10 --N 10 --K 5 --Q 5 --batch_size 2 --test val_wiki
+```
+
+---
+
+## 6) Flags hay dùng
+
+| Flag | Ý nghĩa | Default |
+|------|---------|---------|
+| `--train_iter` | số bước train | 30000 |
+| `--val_step` | validate mỗi N bước | 2000 |
+| `--val_iter` / `--test_iter` | số episode val/test | 1000 / 10000 |
+| `--lr` | learning rate (`-1` = auto: 2e-5 cho bert/roberta/llm) | -1 |
+| `--na_rate` | NOTA (FewRel 2.0) | 0 |
+| `--llm_4bit` / `--llm_no_lora` | quantize / tắt LoRA | off |
+| `--num_experts` `--expert_dim` | MoE size | 4 / 128 |
+| `--wandb` | log W&B | off |
+| `--only_test --load_ckpt PATH` | chỉ eval | |
+
+```bash
+# Chỉ eval checkpoint đã train (5-way 5-shot)
+python train_demo.py --only_test \
+  --load_ckpt checkpoint/moegraph-llm-train_wiki-val_wiki-5-5.pth.tar \
+  --model moegraph --encoder llm --llm_model gpt2 \
+  --N 5 --K 5 --Q 5 --test val_wiki
+```
+
+---
+
+## 7) Domain / NOTA (FewRel 2.0)
+
+```bash
+# Domain adaptation → PubMed (5-way 1-shot)
+python train_demo.py --model proto --encoder roberta \
+  --val val_pubmed --test val_pubmed --N 5 --K 1 --hidden_size 768
+
+# NOTA ~50% trong 5-way 1-shot (na_rate=5 → NA = Q*5)
+python train_demo.py --model pair --encoder roberta --pair --na_rate 5 \
+  --N 5 --K 1 --Q 1 --hidden_size 768 --test val_wiki
+```

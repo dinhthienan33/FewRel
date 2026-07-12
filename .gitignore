@@ -1,6 +1,12 @@
 # folders
 checkpoint
 test_result
+wandb
+
+# secrets
+.env
+.env.local
+*.pem
 
 # files
 *.pyc

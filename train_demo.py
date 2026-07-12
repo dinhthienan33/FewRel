@@ -14,6 +14,7 @@ from models.moe_graph import MoEGraphProto
 from fewshot_re_kit.llm_encoder import LLMSentenceEncoder
 from fewshot_re_kit.roberta_encoder import RobertaGraphEncoder
 from fewshot_re_kit.wandb_utils import init_wandb_run, log_metrics, finish_run
+from fewshot_re_kit.env_utils import load_dotenv_file, first_nonempty
 import sys
 import torch
 from torch import optim, nn
@@ -22,6 +23,32 @@ import json
 import argparse
 import os
 from datetime import datetime
+
+try:
+    from adopt import ADOPT
+except ImportError:
+    ADOPT = None
+
+
+def _resolve_wandb_settings(opt):
+    """Prefer .env / process env, then fall back to CLI flags."""
+    api_key = first_nonempty(os.environ.get("WANDB_API_KEY"), opt.wandb_api_key)
+    project = first_nonempty(os.environ.get("WANDB_PROJECT"), opt.wandb_project) or "FewRel"
+    entity = first_nonempty(os.environ.get("WANDB_ENTITY"), opt.wandb_entity) or None
+    mode = first_nonempty(os.environ.get("WANDB_MODE"), opt.wandb_mode) or "online"
+    if mode not in {"online", "offline", "auto"}:
+        mode = "online"
+    env_enable = first_nonempty(os.environ.get("WANDB"), os.environ.get("WANDB_ENABLE")).lower()
+    use_wandb = bool(opt.wandb) or env_enable in {"1", "true", "yes", "on"}
+    if first_nonempty(os.environ.get("WANDB_DISABLED")).lower() in {"1", "true", "yes"}:
+        use_wandb = False
+    return {
+        "enabled": use_wandb,
+        "api_key": api_key or None,
+        "project": project,
+        "entity": entity,
+        "mode": mode,
+    }
 
 def main():
     parser = argparse.ArgumentParser()
@@ -70,7 +97,13 @@ def main():
     parser.add_argument('--grad_iter', default=1, type=int,
            help='accumulate gradient every x iterations')
     parser.add_argument('--optim', default='sgd',
-           help='sgd / adam / adamw')
+           help='sgd / adam / adamw / adopt')
+    parser.add_argument('--adopt_beta1', default=0.9, type=float,
+           help='ADOPT beta1')
+    parser.add_argument('--adopt_beta2', default=0.9999, type=float,
+           help='ADOPT beta2')
+    parser.add_argument('--adopt_eps', default=1e-6, type=float,
+           help='ADOPT epsilon')
     parser.add_argument('--hidden_size', default=230, type=int,
            help='hidden size')
     parser.add_argument('--load_ckpt', default=None,
@@ -114,7 +147,9 @@ def main():
     parser.add_argument('--llm_4bit', action='store_true',
            help='load the llm encoder in 4-bit (needs bitsandbytes + CUDA)')
     parser.add_argument('--llm_no_lora', action='store_true',
-           help='disable LoRA on the llm encoder (freeze it instead)')
+           help='disable LoRA on moegraph encoders (roberta/llm); backbone is frozen unless --unfreeze_backbone')
+    parser.add_argument('--unfreeze_backbone', action='store_true',
+           help='full-finetune the moegraph encoder backbone (roberta/llm); default is freeze when LoRA is off')
     parser.add_argument('--lora_r', default=8, type=int, help='LoRA rank')
     parser.add_argument('--lora_alpha', default=32, type=int, help='LoRA alpha')
     parser.add_argument('--num_experts', default=4, type=int,
@@ -142,7 +177,7 @@ def main():
     parser.add_argument('--wandb_entity', default=None,
            help='W&B entity/team (optional)')
     parser.add_argument('--wandb_api_key', default=None,
-           help='W&B API key (prefer WANDB_API_KEY env var)')
+           help='W&B API key (fallback; prefer WANDB_API_KEY in .env)')
     parser.add_argument('--wandb_mode', default='online',
            choices=['online', 'offline', 'auto'],
            help='W&B mode')
@@ -152,6 +187,11 @@ def main():
            help='do not fall back to offline mode on online init failure')
 
     opt = parser.parse_args()
+    dotenv_path = load_dotenv_file()
+    if dotenv_path:
+        print("[ENV] Loaded {}".format(dotenv_path))
+    wandb_cfg = _resolve_wandb_settings(opt)
+
     trainN = opt.trainN
     N = opt.N
     K = opt.K
@@ -198,7 +238,8 @@ def main():
                     load_4bit=opt.llm_4bit,
                     use_lora=not opt.llm_no_lora,
                     lora_r=opt.lora_r,
-                    lora_alpha=opt.lora_alpha)
+                    lora_alpha=opt.lora_alpha,
+                    freeze_backbone=not opt.unfreeze_backbone)
         else:
             pretrain_ckpt = opt.pretrain_ckpt or 'roberta-base'
             if opt.pair:
@@ -219,7 +260,8 @@ def main():
                 load_4bit=opt.llm_4bit,
                 use_lora=not opt.llm_no_lora,
                 lora_r=opt.lora_r,
-                lora_alpha=opt.lora_alpha)
+                lora_alpha=opt.lora_alpha,
+                freeze_llm=not opt.unfreeze_backbone)
     else:
         raise NotImplementedError
     
@@ -251,8 +293,18 @@ def main():
     elif opt.optim == 'adam':
         pytorch_optim = optim.Adam
     elif opt.optim == 'adamw':
-        from transformers import AdamW
-        pytorch_optim = AdamW
+        try:
+            from transformers import AdamW as HFAdamW
+            pytorch_optim = HFAdamW
+        except ImportError:
+            pytorch_optim = torch.optim.AdamW
+    elif opt.optim == 'adopt':
+        if ADOPT is None:
+            raise ImportError(
+                "ADOPT not found. Ensure FewRel/adopt is on PYTHONPATH "
+                "(vendored from 0104docred/adopt-main)."
+            )
+        pytorch_optim = ADOPT
     else:
         raise NotImplementedError
     if opt.adv:
@@ -313,19 +365,19 @@ def main():
         model.cuda()
 
     use_wandb = False
-    if opt.wandb:
+    if wandb_cfg["enabled"]:
         run_name = opt.wandb_run_name or prefix
         run_name = "{}_{}".format(run_name, datetime.now().strftime("%Y%m%d-%H%M%S"))
-        allow_offline_fallback = (opt.wandb_mode != "online") and (not opt.wandb_no_offline_fallback)
+        allow_offline_fallback = (wandb_cfg["mode"] != "online") and (not opt.wandb_no_offline_fallback)
         wandb_config = {k: v for k, v in vars(opt).items() if k != "wandb_api_key"}
         use_wandb = bool(
             init_wandb_run(
                 run_name,
                 wandb_config,
-                project=opt.wandb_project,
-                entity=opt.wandb_entity,
-                api_key=opt.wandb_api_key,
-                mode=opt.wandb_mode,
+                project=wandb_cfg["project"],
+                entity=wandb_cfg["entity"],
+                api_key=wandb_cfg["api_key"],
+                mode=wandb_cfg["mode"],
                 allow_offline_fallback=allow_offline_fallback,
             )
         )
@@ -350,7 +402,10 @@ def main():
                 na_rate=opt.na_rate, val_step=opt.val_step, fp16=opt.fp16, pair=opt.pair, 
                 train_iter=opt.train_iter, val_iter=opt.val_iter, bert_optim=bert_optim, 
                 learning_rate=opt.lr, use_sgd_for_bert=opt.use_sgd_for_bert,
-                grad_iter=opt.grad_iter, use_wandb=use_wandb)
+                grad_iter=opt.grad_iter, use_wandb=use_wandb,
+                weight_decay=opt.weight_decay,
+                adopt_betas=(opt.adopt_beta1, opt.adopt_beta2),
+                adopt_eps=opt.adopt_eps)
     else:
         ckpt = opt.load_ckpt
         if ckpt is None:

@@ -90,13 +90,14 @@ def _is_permission_error(exc):
 
 
 def _resolve_api_key(explicit_key, cfg_key):
+    # Priority: .env / process env -> CLI arg -> local config
     arg_key = str(explicit_key).strip() if explicit_key is not None else ""
     env_key = str(os.environ.get("WANDB_API_KEY", "")).strip()
     config_key = str(cfg_key).strip()
-    if arg_key:
-        return arg_key, "argument"
     if env_key:
         return env_key, "env"
+    if arg_key:
+        return arg_key, "argument"
     if config_key:
         return config_key, "config"
     return "", "none"

@@ -134,7 +134,9 @@ class FewShotREFramework:
               adv_dis_lr=1e-1,
               adv_enc_lr=1e-1,
               use_sgd_for_bert=False,
-              use_wandb=False):
+              use_wandb=False,
+              adopt_betas=(0.9, 0.9999),
+              adopt_eps=1e-6):
         '''
         model: a FewShotREModel instance
         model_name: Name of the model
@@ -152,10 +154,12 @@ class FewShotREFramework:
         test_iter: Num of iterations of testing
         '''
         print("Start training...")
+
+        use_adopt = getattr(pytorch_optim, "__name__", "") == "ADOPT"
     
         # Init
         if bert_optim:
-            print('Use bert optim!')
+            print('Use bert optim!' if not use_adopt else 'Use ADOPT optim (encoder)!')
             parameters_to_optimize = list(model.named_parameters())
             no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
             parameters_to_optimize = [
@@ -166,26 +170,72 @@ class FewShotREFramework:
             ]
             if use_sgd_for_bert:
                 optimizer = torch.optim.SGD(parameters_to_optimize, lr=learning_rate)
+            elif use_adopt:
+                optimizer = pytorch_optim(
+                    parameters_to_optimize,
+                    lr=learning_rate,
+                    betas=adopt_betas,
+                    eps=adopt_eps,
+                    decouple=True,
+                )
             else:
                 try:
                     optimizer = AdamW(parameters_to_optimize, lr=learning_rate, correct_bias=False)
                 except TypeError:
                     optimizer = AdamW(parameters_to_optimize, lr=learning_rate)
             if self.adv:
-                try:
-                    optimizer_encoder = AdamW(parameters_to_optimize, lr=1e-5, correct_bias=False)
-                except TypeError:
-                    optimizer_encoder = AdamW(parameters_to_optimize, lr=1e-5)
+                if use_adopt:
+                    optimizer_encoder = pytorch_optim(
+                        parameters_to_optimize,
+                        lr=1e-5,
+                        betas=adopt_betas,
+                        eps=adopt_eps,
+                        decouple=True,
+                    )
+                else:
+                    try:
+                        optimizer_encoder = AdamW(parameters_to_optimize, lr=1e-5, correct_bias=False)
+                    except TypeError:
+                        optimizer_encoder = AdamW(parameters_to_optimize, lr=1e-5)
             scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_step, num_training_steps=train_iter) 
         else:
-            optimizer = pytorch_optim(model.parameters(),
-                    learning_rate, weight_decay=weight_decay)
+            if use_adopt:
+                print('Use ADOPT optim!')
+                optimizer = pytorch_optim(
+                    model.parameters(),
+                    lr=learning_rate,
+                    betas=adopt_betas,
+                    eps=adopt_eps,
+                    weight_decay=weight_decay,
+                    decouple=True,
+                )
+            else:
+                optimizer = pytorch_optim(model.parameters(),
+                        learning_rate, weight_decay=weight_decay)
             if self.adv:
-                optimizer_encoder = pytorch_optim(model.parameters(), lr=adv_enc_lr)
+                if use_adopt:
+                    optimizer_encoder = pytorch_optim(
+                        model.parameters(),
+                        lr=adv_enc_lr,
+                        betas=adopt_betas,
+                        eps=adopt_eps,
+                        decouple=True,
+                    )
+                else:
+                    optimizer_encoder = pytorch_optim(model.parameters(), lr=adv_enc_lr)
             scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step_size)
 
         if self.adv:
-            optimizer_dis = pytorch_optim(self.d.parameters(), lr=adv_dis_lr)
+            if use_adopt:
+                optimizer_dis = pytorch_optim(
+                    self.d.parameters(),
+                    lr=adv_dis_lr,
+                    betas=adopt_betas,
+                    eps=adopt_eps,
+                    decouple=True,
+                )
+            else:
+                optimizer_dis = pytorch_optim(self.d.parameters(), lr=adv_dis_lr)
 
         if load_ckpt:
             state_dict = self.__load_model__(load_ckpt)['state_dict']

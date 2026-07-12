@@ -22,7 +22,7 @@ class RobertaGraphEncoder(nn.Module):
         lora_r=8,
         lora_alpha=32,
         lora_dropout=0.05,
-        freeze_backbone=False,
+        freeze_backbone=True,
     ):
         nn.Module.__init__(self)
         self.max_length = max_length

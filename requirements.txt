@@ -1,0 +1,33 @@
+# FewRel dependencies (Python 3.10+ recommended)
+#
+# CPU / default:
+#   pip install -r requirements.txt
+#
+# CUDA torch (example cu124):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+#
+# Sanity:
+#   python -c "import torch, transformers, wandb; print(torch.__version__, torch.cuda.is_available())"
+
+# --- core (baselines + moegraph) ---
+torch>=2.1
+numpy>=1.24,<3
+transformers>=4.36
+scikit-learn>=1.3
+tqdm>=4.66
+
+# --- LLM encoder (--encoder llm) ---
+accelerate>=0.25
+sentencepiece>=0.1.99
+# optional LoRA / 4-bit (graceful fallback if missing)
+peft>=0.7
+bitsandbytes>=0.43.0; platform_system != "Darwin"
+
+# --- logging (--wandb) ---
+wandb>=0.16
+
+# --- optional ---
+# NVIDIA Apex for --fp16 with older FewRel scripts:
+#   https://github.com/NVIDIA/apex
+# python-dotenv>=1.0   # if you want auto-load of .env

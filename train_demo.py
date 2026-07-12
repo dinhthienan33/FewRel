@@ -12,6 +12,7 @@ from models.d import Discriminator
 from models.mtb import Mtb
 from models.moe_graph import MoEGraphProto
 from fewshot_re_kit.llm_encoder import LLMSentenceEncoder
+from fewshot_re_kit.roberta_encoder import RobertaGraphEncoder
 from fewshot_re_kit.wandb_utils import init_wandb_run, log_metrics, finish_run
 import sys
 import torch
@@ -53,7 +54,9 @@ def main():
     parser.add_argument('--model', default='proto',
             help='model name')
     parser.add_argument('--encoder', default='cnn',
-            help='encoder: cnn or bert or roberta')
+            help='encoder: cnn | bert | roberta | llm '
+                 '(moegraph: use roberta or llm; default ckpt for moegraph+roberta '
+                 'is FacebookAI/xlm-roberta-large)')
     parser.add_argument('--max_length', default=128, type=int,
            help='max length')
     parser.add_argument('--lr', default=-1, type=float,
@@ -86,7 +89,8 @@ def main():
     parser.add_argument('--pair', action='store_true',
            help='use pair model')
     parser.add_argument('--pretrain_ckpt', default=None,
-           help='bert / roberta pre-trained checkpoint')
+           help='bert / roberta HF id or path '
+                '(moegraph+roberta default: FacebookAI/xlm-roberta-large)')
     parser.add_argument('--cat_entity_rep', action='store_true',
            help='concatenate entity representation as sentence rep')
 
@@ -185,17 +189,30 @@ def main():
                     cat_entity_rep=opt.cat_entity_rep,
                     mask_entity=opt.mask_entity)
     elif encoder_name == 'roberta':
-        pretrain_ckpt = opt.pretrain_ckpt or 'roberta-base'
-        if opt.pair:
-            sentence_encoder = RobertaPAIRSentenceEncoder(
-                    pretrain_ckpt,
-                    max_length)
-        else:
-            sentence_encoder = RobertaSentenceEncoder(
+        if model_name == 'moegraph':
+            # Graph-compatible XLM-R / RoBERTa (full token states + entity markers)
+            pretrain_ckpt = opt.pretrain_ckpt or 'FacebookAI/xlm-roberta-large'
+            sentence_encoder = RobertaGraphEncoder(
                     pretrain_ckpt,
                     max_length,
-                    cat_entity_rep=opt.cat_entity_rep)
+                    load_4bit=opt.llm_4bit,
+                    use_lora=not opt.llm_no_lora,
+                    lora_r=opt.lora_r,
+                    lora_alpha=opt.lora_alpha)
+        else:
+            pretrain_ckpt = opt.pretrain_ckpt or 'roberta-base'
+            if opt.pair:
+                sentence_encoder = RobertaPAIRSentenceEncoder(
+                        pretrain_ckpt,
+                        max_length)
+            else:
+                sentence_encoder = RobertaSentenceEncoder(
+                        pretrain_ckpt,
+                        max_length,
+                        cat_entity_rep=opt.cat_entity_rep)
     elif encoder_name == 'llm':
+        if model_name != 'moegraph':
+            raise ValueError("--encoder llm is only supported with --model moegraph")
         sentence_encoder = LLMSentenceEncoder(
                 opt.llm_model,
                 max_length,
@@ -205,6 +222,11 @@ def main():
                 lora_alpha=opt.lora_alpha)
     else:
         raise NotImplementedError
+    
+    if model_name == 'moegraph' and encoder_name not in ('roberta', 'llm'):
+        raise ValueError(
+            "moegraph requires --encoder roberta (recommended: FacebookAI/xlm-roberta-large) "
+            "or --encoder llm")
     
     if opt.pair:
         train_data_loader = get_loader_pair(opt.train, sentence_encoder,
